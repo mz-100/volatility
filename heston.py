@@ -183,7 +183,7 @@ class Heston:
             the array of strikes. 
         """
         return implied_vol(forward_price, maturity, strike,
-                           self.call_price(forward_price, maturity, strike, epsabs, epsrel),
+                           self.call_price(forward_price, maturity, strike, epsabs=epsabs, epsrel=epsrel),
                            call_or_put_flag=1)
     
     @classmethod
@@ -217,7 +217,7 @@ class Heston:
         """
         if initial_guess is None:
             v0 = implied_vol[np.abs(strikes-forward_price).argmin()]**2  # ATM variance
-            x0 = (v0, 1.0, v0, 1.0, -0.5),  # (V0, kappa, theta, sigma, rho)
+            x0 = (v0, 1.0, v0, 1.0, -0.5)  # (V0, kappa, theta, sigma, rho)
         else:
             x0 = (initial_guess.v0, initial_guess.kappa, initial_guess.theta, initial_guess.sigma,
                   initial_guess.rho)

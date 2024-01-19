@@ -48,7 +48,7 @@ def implied_vol(forward_price, maturity, strike, option_price, call_or_put_flag=
             # If there are invalid prices, we call `implied_vol` for valid prices only
             # If all prices are valid, we'll proceed to Newton's method
             if np.any(invalid):
-                sigma = np.empty_like(K)
+                sigma = np.empty_like(strike)
                 sigma[~invalid] = implied_vol(
                     forward_price=forward_price,
                     maturity=maturity,
@@ -73,7 +73,7 @@ def implied_vol(forward_price, maturity, strike, option_price, call_or_put_flag=
     def fprime(sigma):
         return np.exp(x/2)*norm.pdf(x/sigma+sigma/2)
 
-    res = newton(func=f, x0=sigma0, fprime=None, full_output=True)
+    res = newton(func=f, x0=sigma0, fprime=None, full_output=True, disp=False)
 
     if np.isscalar(strike):
         return res[0]/math.sqrt(maturity) if res[1].converged else np.NaN
