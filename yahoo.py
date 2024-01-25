@@ -434,7 +434,7 @@ class YFinanceData:
         """
         return self.forward_prices[min_maturity:max_maturity].index.to_list()
     
-    def get_implied_vol(self, maturity, moneyness_bounds=None, delta_bounds=None,
+    def get_implied_vol(self, maturity, moneyness_bounds=None, min_abs_delta=None,
                         return_total_var=False, as_numpy=False):
         """The implied volatility or total variance curve of OTM options at a given maturity.
 
@@ -446,9 +446,8 @@ class YFinanceData:
                 defined as forward/strike for calls and strike/forward for puts. Thus, OTM options
                 have moneyness < 1, and ITM options have moneyness > 1. If moneyness_bounds is None,
                 all options are included. To omit one of the bounds, set it to 0 or inf.
-            delta_bounds ((float, float)): Tuple of two floats representing the lower and upper
-                bounds for the delta of the options to include in the curve. If None, all options
-                are included. To omit one of the bounds, set it to -1 or 1.
+            min_abs_delta (float): Only options with the absolute value of delta not smaller than
+                this number will be included in the curve. If None, all options are included.
             return_total_var (bool): If False, return the implied volatility curve in the
                 coordinates (strike, implied_vol). If True, return the total variance curve in the
                 coordinates (log_strike, total_var), where `log_strike = log(strike/forward)`.
@@ -464,8 +463,8 @@ class YFinanceData:
         """
         if moneyness_bounds is None:
             moneyness_bounds = (-np.inf, np.inf)
-        if delta_bounds is None:
-            delta_bounds = (-np.inf, np.inf)
+        if min_abs_delta is None:
+            min_abs_delta = 0
 
         # options with the given maturity and filtered for moneyness and delta
         options = self.options.loc[maturity].copy().reset_index()
@@ -474,7 +473,7 @@ class YFinanceData:
             axis=1)
         filtered_options = options[options.OTM &
                                    options.moneyness.between(*moneyness_bounds) &
-                                   options.delta.between(*delta_bounds)]
+                                   (options.delta.abs() >= min_abs_delta)]
 
         if return_total_var:
             returned_data = filtered_options.set_index('logStrike').sort_index().totalVar
