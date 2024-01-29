@@ -271,10 +271,11 @@ class SVI:
         Notes:
             The algorithm used is the two-step minimization procedure by Zeliade systems.
         """
+        bounds = [(min(x), max(x)), (min_sigma, max_sigma)]
         res = optimize.dual_annealing(
             lambda q: cls._calibrate_adc(x, w, q[0], q[1])[1],  # q=(m, sigma)
-            bounds=[(min(x), max(x)), (min_sigma, max_sigma)],
-            minimizer_kwargs={"method": "nelder-mead"})
+            bounds=bounds,
+            minimizer_kwargs={"method": "L-BFGS-B", "bounds" : bounds})
         m, sigma = res.x
         a, d, c = cls._calibrate_adc(x, w, m, sigma)[0]
         rho = d/c
