@@ -1,6 +1,8 @@
 from dataclasses import dataclass
+import math
 import numpy as np
-from scipy import optimize  
+from scipy import optimize
+from scipy.interpolate import interp1d
 
 
 @dataclass
@@ -285,3 +287,232 @@ class SVI:
             return ret, res
         else:
             return ret
+
+
+class ESSVI:
+    """The Extended Surface SVI model.
+
+    This class implements the eSSVI model by Corbetta, et al. (2019). Volatility smiles in the model
+    are modelled by the equation
+    ```
+        w(x) = 0.5*(theta + rho*psi*x + sqrt((psi*x + theta*rho)^2 + theta^2*(1-rho)^2)),
+    ```
+    where `w` is the total implied variance, `x` is the log-moneyness (`log(strike/forward)`), and
+    `theta`, `psi`, `rho` are maturity-dependent model parameters. The parameters `theta`, `psi` and 
+    `rho*psi` are interpolated linearly between the given maturities.
+
+    The main advantage of the model is that it can be easily calibrated free of static arbitrage.
+    
+    Methods:
+        total_var: Total variance.
+        __call__: Total variance.
+        implied_vol: Implied volatility.
+        local_vol: Local volatility.
+        calibrate: Model calibration.    
+    """
+
+    def __init__(self, maturities, theta, psi, rho):
+        """Initializes the model and builds linear interpolation of the parameters.
+
+        Args:
+            maturities (array): Array of maturities.
+            theta (array): Array of `theta` parameters for each maturity.
+            psi (array): Array of `psi` parameters for each maturity.
+            rho (array): Array of `rho` parameters for each maturity.
+        """
+        # Add t=0 and then interpolate linearly
+        maturities_ = np.concatenate(([0], maturities))
+        theta_ = np.concatenate(([0], theta))
+        psi_ = np.concatenate(([0], psi))
+        rho_ = np.concatenate(([rho[0]], rho))
+        self._theta = interp1d(maturities_, theta_, kind="linear")
+        self._psi = interp1d(maturities_, psi_, kind="linear")
+        self._rhopsi = interp1d(maturities_, rho_*psi_, kind="linear")
+
+    @staticmethod
+    def _essvi(x, theta, psi, rho):
+        """The eSSVI function."""
+        return 0.5*(theta + rho*psi*x + np.sqrt((psi*x + rho*theta)**2 + theta**2*(1 - rho**2)))
+    
+    def total_var(self, maturity, log_moneyness):
+        """Computes the total implied variance.
+
+        Args:
+            maturity (float or array): Maturity.
+            log_moneyness (float or array): Log-moneyness.
+        
+        Returns:
+            float or array: Total implied variance for the given maturity and log-moneyness.
+        """
+        return self._essvi(log_moneyness, self._theta(maturity), self._psi(maturity), self._rhopsi(maturity)/self._psi(maturity))
+    
+    def __call__(self, maturity, log_moneyness):
+        """Computes the total implied variance.
+
+        Args:
+            maturity (float or array): Maturity.
+            log_moneyness (float or array): Log-moneyness.
+
+        Returns:
+            float or array: Total implied variance for the given maturity and log-moneyness.
+        """
+        return self.total_var(maturity, log_moneyness)
+    
+    def implied_vol(self, forward_price, maturity, strike):
+        """Computes the implied volatility.
+
+        Args:
+            forward_price (float or array): Forward price.
+            maturity (float or array): Maturity.
+            strike (float or array): Strike price.
+
+        Returns:
+            float or array: Implied volatility for the given forward price, maturity and strike.
+        """
+        x = np.log(strike/forward_price)
+        return np.sqrt(self.total_var(maturity, x)/maturity)
+    
+    def local_vol(self, initial_price, time, spot_price, discount_factor=1):
+        """Computes the local volatility function of the underlying's spot price.
+
+        Args:
+            initial_price (float or array): Initial price of the underlying.
+            time (float or array): Time variable as an argument of the local volatility function.
+            spot_price (float or array): Spot price as an argument of the local volatility function.
+            discount_factor (float or array): Discount factor for maturity equal to `time`.
+
+        Returns:
+            float or array: Local volatility function.
+        """
+        theta = self._theta(time)
+        psi = self._psi(time)
+        rho = self._rhopsi(time)/psi
+        forward_price = initial_price/discount_factor
+        
+        # We use the formula from Gatheral's "Volatility Surface", p. 13, eq. 1.10.
+        x = np.log(spot_price/forward_price)
+        A = np.sqrt((psi*x + rho*theta)**2 + theta**2*(1 - rho**2))
+        w = 0.5*(theta + rho*psi*x + A)
+
+        dw_dx = 0.5*(rho*psi + (psi*x+theta*rho)*psi/A)
+        d2w_dx2 = 0.5*psi**2*(1/A - (psi*x+theta*rho)**2/A**3)
+        dw_dtheta = 0.5*(1 + (psi*x*rho+theta)/A)
+        dw_dpsi = 0.5*x*(rho + (psi*x + theta*rho)/A)
+        dw_drho = 0.5*psi*x*(1 + theta/A)
+
+        # Compute the time derivatives of the parameters by small bumps (they are linearly
+        # interpolated, so this should work OK, but not optimal)
+        dt = 1e-6
+        dtheta_dt = (self._theta(time+dt) - theta)/dt
+        dpsi_dt = (self._psi(time+dt) - psi)/dt
+        drho_dt = (self._rhopsi(time+dt)/self._psi(time+dt) - rho)/dt
+        dw_dt = dw_dtheta*dtheta_dt + dw_dpsi*dpsi_dt + dw_drho*drho_dt
+
+        v = dw_dt / (1 - x/w*dw_dx + 0.25*(-0.25-1/w+x**2/w**2) * (dw_dx)**2 + 0.5*d2w_dx2)
+
+        return np.sqrt(v)
+    
+    @staticmethod
+    def _calibrate_slice(x, w, theta_prev=None, psi_prev=None, rho_prev=None, rho_sample_size=20, rho_refinements=4):
+        """Calibrates one slice of the eSSVI surface in an arbitrage-free way."""
+        # See the algorithm in the paper by Corbetta, et al. (2019)
+
+        # First, choose x* and theta* - the closest point to the ATMF total implied variance.
+        if theta_prev is not None:
+            w_prev = ESSVI._essvi(x, theta_prev, psi_prev, rho_prev)
+        else:
+            w_prev = 0
+        x_star_index = np.argmin(np.abs(np.where(w_prev < w, x, math.inf)))
+        x_star = x[x_star_index]
+        theta_star = w[x_star_index]
+        if theta_star < w[x_star_index]:
+            raise RuntimeError("The next SVI slice is completely below the calibrated slice")
+        
+        # We need to find the optimal psi and rho. For each rho, we find psi by a bounded
+        # minimization method. Then we search for the optimal rho by a simple grid search with
+        # several level of refinements.
+        rhos = np.linspace(-0.999, 0.999, rho_sample_size)
+        opt_psi = np.empty_like(rhos)
+        min_value = np.empty_like(rhos)
+
+        for n in range(rho_refinements):
+            for i, rho in enumerate(rhos):
+                upper_bound = min(
+                    -2*rho*x_star/(1+abs(rho)) + math.sqrt(4*(rho*x_star)**2/(1+abs(rho))**2 + 4*theta_star/(1+abs(rho))),
+                    4/(1+abs(rho)),
+                    theta_star/(rho*x_star) if rho*x_star > 0 else math.inf)
+                if theta_prev is None:
+                    lower_bound = 0
+                else:
+                    lower_bound = max(
+                        0, 
+                        (psi_prev - rho_prev*psi_prev)/(1-rho), (psi_prev+rho_prev*psi_prev)/(1+rho))
+                    if rho*x_star < 0:
+                        lower_bound = max(lower_bound, (theta_star-theta_prev)/(rho*x_star))
+                    elif rho*x_star > 0:
+                        upper_bound = min(upper_bound, (theta_star-theta_prev)/(rho*x_star))
+                if lower_bound > upper_bound:
+                    opt_psi[i] = math.nan
+                    min_value[i] = math.inf
+                else:
+                    res = optimize.minimize_scalar(
+                        lambda psi : np.linalg.norm(ESSVI._essvi(x, theta_star-rho*psi*x_star, psi, rho) - w), 
+                        bounds = (lower_bound, upper_bound))
+                    if res.success:
+                        opt_psi[i] = res.x
+                        min_value[i] = res.fun
+                    else:
+                        opt_psi[i] = math.nan
+                        min_value[i] = math.inf
+
+            opt_i = np.argmin(min_value)
+            
+            if n == rho_refinements-1:
+                break
+
+            if opt_i == 0:
+                rhos = np.linspace(rhos[0], rhos[1], rho_sample_size)
+            elif opt_i == rho_sample_size-1:
+                rhos = np.linspace(rhos[-2], rhos[-1], rho_sample_size)
+            else:
+                rhos = np.linspace(rhos[opt_i-1], rhos[opt_i+1], rho_sample_size)
+            
+        if math.isnan(opt_psi[opt_i]):
+            return math.nan, math.nan, math.nan
+        else:
+            return theta_star-rhos[opt_i]*opt_psi[opt_i]*x_star, opt_psi[opt_i], rhos[opt_i]
+        
+    @classmethod
+    def calibrate(cls, maturity, log_moneyness, total_var, rho_sample_size=20, rho_refinements=4):
+        """Calibrates the eSSVI model.
+
+        This function calibrates the eSSVI model by calibrating each slice of the total implied
+        variance surface separately avoiding the static arbitrage. The method is described in
+        the paper by Corbetta, et al. (2019).
+
+        Args:
+            maturity (list or array): Array of maturities.
+            log_moneyness (list of arrays): List of arrays of available log-moneynesses for each maturity.
+            total_var (list of array): Total implied variances corresponding to the log-moneynesses.
+            rho_sample_size (int): Number of points `rho` in one step of the grid search.
+            rho_refinements (int): Number of refinements of the grid search.
+
+        Returns:
+            ESSVI: An instance of the class with the calibrated parameters.
+        """
+        theta = np.empty(len(maturity))
+        psi = np.empty_like(theta)
+        rho = np.empty_like(theta)
+        
+        # First slice - without arbitrage constraints
+        theta[0], psi[0], rho[0] = cls._calibrate_slice(
+            log_moneyness[0], total_var[0],
+            rho_sample_size=rho_sample_size, rho_refinements=rho_refinements)
+        
+        # For next slices we do impose constraints
+        for i in range(1, len(maturity)):
+            theta[i], psi[i], rho[i] = ESSVI._calibrate_slice(
+                log_moneyness[i], total_var[i], theta_prev=theta[i-1], psi_prev=psi[i-1], rho_prev=rho[i-1],
+                rho_sample_size=rho_sample_size, rho_refinements=rho_refinements)
+
+        return cls(maturity, theta, psi, rho)
