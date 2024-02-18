@@ -1,7 +1,15 @@
 from dataclasses import dataclass
+import math
 import numpy as np
 from scipy.optimize import minimize
 
+# This function is needed to avoid division by zero problem when zero is passed as maturity
+@np.vectorize
+def _nelson_siegel_exp(x):
+    if math.isclose(x, 0):
+        return 1.0
+    else:
+        return (1 - math.exp(-x)) / x
 
 @dataclass
 class NelsonSiegel:
@@ -9,7 +17,7 @@ class NelsonSiegel:
 
     The Nelson-Siegel model is a parametric model defined by the formula
     ```
-        y(t) = beta2 + beta2 * (1 - exp(-lambda*t)) / (lambda*t) 
+        y(t) = beta1 + beta2 * (1 - exp(-lambda*t)) / (lambda*t) 
             + beta3 * ((1 - exp(-lambda*t)) / (lambda*t) - exp(-lambda*t)) 
     ```
     where `t` is the time to maturity, `y(t)` is the yield, and `beta1`, `beta2`, `beta3`, `lambda`
@@ -31,15 +39,6 @@ class NelsonSiegel:
     beta3: float
     lambda_: float
 
-    # The next function is needed to avoid division by zero problem when zero is passed as maturity
-    @staticmethod
-    @np.vectorize
-    def _beta2_loading(x):
-        if np.isclose(x, 0):
-            return 1
-        else:
-            return (1 - np.exp(-x)) / x
-
     def yield_curve(self, t):
         """Returns the yield curve at time `t`.
 
@@ -49,7 +48,7 @@ class NelsonSiegel:
         Returns:
             float or array: Yield curve at time `t`.        
         """
-        return (self.beta1 + (self.beta2 + self.beta3) * NelsonSiegel._beta2_loading(t*self.lambda_)
+        return (self.beta1 + (self.beta2 + self.beta3) * _nelson_siegel_exp(t*self.lambda_)
                 - self.beta3 * np.exp(-self.lambda_*t))
     
     def __call__(self, t):
@@ -87,21 +86,20 @@ class NelsonSiegel:
         Returns:
             NelsonSiegel: Calibrated Nelson-Siegel model.        
         """
-        # For a given decay factor, we find betas by linear regression
-        def find_beta(lambda_):
+        # For a given decay factor, find betas by OLS
+        # This function returns a tuple with the first element being the betas and the second
+        # element being the squared residuals; we ignore other elements 
+        def beta_ols(lambda_):
             A = np.vstack([
-                np.ones_like(t), NelsonSiegel._beta2_loading(t*lambda_), 
-                NelsonSiegel._beta2_loading(t*lambda_) - np.exp(-lambda_*t)]).T 
-            return np.linalg.lstsq(A, y, rcond=None)[0]
+                np.ones_like(t), _nelson_siegel_exp(t*lambda_), 
+                _nelson_siegel_exp(t*lambda_) - np.exp(-lambda_*t)]).T 
+            return np.linalg.lstsq(A, y, rcond=None)
         
-        # We minimize the mean square error of the yield curve to find the decay factor
-        def loss(lambda_):
-            beta = find_beta(lambda_)
-            return np.sum((y - cls(*beta, lambda_).yield_curve(t))**2)
-        
-        res = minimize(loss, 1)
+        # Initial guess maximizes the loading on the medium-term factor at 30 months
+        # (from Diebold and Li, 2006)        
+        res = minimize(lambda lambda_: beta_ols(lambda_)[1], 0.0609) 
+
         if not res.success:
             raise ValueError("Calibration failed")
-        
-        return cls(*find_beta(res.x), res.x)
+        return cls(*beta_ols(res.x[0])[0], res.x[0])
     
