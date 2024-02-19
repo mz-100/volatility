@@ -1,93 +1,149 @@
 import math
 import numpy as np
-import yfinance as yf
 import pandas as pd
-import pytz
-import pickle
-from scipy.stats import norm
-from datetime import datetime
-from scipy import interpolate
+import datetime 
+from scipy.optimize import root_scalar
 from openpyxl import load_workbook
-from .impvol import implied_vol
 
 
 class CMTData:
     """Class for loading the Treasury par yield curve (CMT rates) for a given date.
 
     Attributes:
-        date: Date for which the data is loaded.
-        par_yield (Series): Par yield rates as a Pandas time series object.
+        date (date): Date for which the data is loaded.
+        maturities (array): Available maturities, counted in years after `date`. Currently, the
+            maturities are hard-coded to 1 Mo, 3 Mo, 6 Mo, 1 Yr, 2 Yr, 3 Yr, 5 Yr, 7 Yr, 10 Yr,
+            20 Yr, and 30 Yr.
+        yield (array): Par yield rates for the available maturities, as a decimal.
 
     Methods:
         load_from_web: Loads data from the Treasury website.
-        save_to_disk: Saves the object to disk in pickle or Excel format.
-        load_from_disk: Loads the object from disk.
-        ytm_curve: Computes the yield-to-maturity curve from the par yield rates.
+        save_to_disk: Saves data to disk.
+        load_from_disk: Loads data from disk.
+        ytm: Computes the yield-to-maturity curve from the par yield curve.
     """
 
-    def __init__(self, date, par_yield):
-        self.date = date
-        self.par_yield = par_yield
+    date: datetime.date
+    maturities: np.array
+    par_yield: np.array
 
-    def load_from_web(self, date=None):
+    @staticmethod
+    def load_from_web(date=None):
         """Loads the Treasury par yield curve from the Treasury website.
 
         Args:
-            date (datetime): Date for which the data is loaded. If not provided, the current date is used.
+            date (str): Date for which the data is loaded in the YYYY-MM-DD format. If not provided,
+            the current date is used.
         
         Returns:
             CMTData: The object itself with the loaded data.
 
         Notes:
-            If the yield curve is not available for the requested date, the last prior available
-            date is used.
+            If the yield curve is not available for the requested date, the nearest available date
+            is used.
         """
-        pass
+        data = CMTData()
+        data.maturities = np.array([1/12, 3/12, 6/12, 1, 2, 3, 5, 7, 10, 20, 30])
 
-    def save_to_disk(self, filename, backend=None):
-        """Saves data to disk.
+        if date is None:
+            date_ = datetime.datetime.now().date()
+        else:
+            date_ = datetime.datetime.strptime(date, '%Y-%m-%d').date()
+        
+        year = date_.year
+        url = f"https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/{year}/all?type=daily_treasury_yield_curve&field_tdr_date_value={year}&page&_format=csv"
+        df = pd.read_csv(url, parse_dates=['Date'], index_col='Date', date_format='%m/%d/%Y',
+                         usecols=['Date', '1 Mo', '3 Mo', '6 Mo', '1 Yr', '2 Yr', '3 Yr', '5 Yr',
+                                  '7 Yr', '10 Yr', '20 Yr', '30 Yr'])
+        i = df.index.get_indexer([pd.Timestamp(date_)], method='nearest')[0]
+        data.date = df.index[i].date()
+        data.par_yield = df.iloc[i].to_numpy()/100
+
+        return data
+
+    def save_to_disk(self, filename):
+        """Saves data to disk in Excel format.
 
         Args:
             filename (str): Name of the file.
-            backend (str): Backend to use for saving the object. Must be 'pickle' or 'excel'. If
-                None, the backend is determined from the filename extension: '.pkl' or '.dat' for
-                pickle and  '.xlsx' for Excel.
 
         Returns:
             None
+
+        Notes:
+            If the file exists, a sheet called 'CMT' will be added to it.
         """
-        pass
+        cmt = pd.DataFrame(
+            data=[self.par_yield*100],
+            index=[self.date],
+            columns=['1 Mo', '3 Mo', '6 Mo', '1 Yr', '2 Yr', '3 Yr', '5 Yr', '7 Yr', '10 Yr',
+                    '20 Yr', '30 Yr'])
+        cmt.index.rename('Date', inplace=True)
+
+        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+            cmt.to_excel(writer, sheet_name='CMT', header=True, index=True)
+
+        # Nice formatting
+        W = load_workbook(filename)
+        W['CMT'].column_dimensions['A'].width = len('YYYY-MM-DD') + 2
+        for col in'BCDEFGHIJKL': 
+            W['CMT'].column_dimensions[col].width = 7
+        W.save(filename)
 
     @staticmethod
-    def load_from_disk(filename, backend=None):
+    def load_from_disk(filename):
         """Loads data from disk.
 
-        Supports pickle and Excel backends. See `save_to_disk` for details on the format of the
-        saved data.
-
-        Warning: this method does not check that the provided file contains correct (and safe) data.
-        Always perform safety check for data from untrusted sources.
-
         Args:
-            filename (str): Name of the file to load the object from.
-            backend (str): Backend to use for loading the object. Must be 'pickle' or 'excel'. If
-                None, the backend is determined from the filename extension: '.pkl' or '.dat' for
-                pickle and  '.xlsx' for Excel.
+            filename (str): Name of the file.
 
         Returns:
-            CMTData object
+            CMTData object.
         """
-        pass
+        data = CMTData()
+        df = pd.read_excel(filename, sheet_name='CMT', header=0, index_col='Date', 
+                           usecols=['Date', '1 Mo', '3 Mo', '6 Mo', '1 Yr', '2 Yr', '3 Yr',
+                                    '5 Yr', '7 Yr', '10 Yr', '20 Yr', '30 Yr'])
+        data.date = df.index[0].date()
+        data.maturities = np.array([1/12, 3/12, 6/12, 1, 2, 3, 5, 7, 10, 20, 30])
+        data.par_yield = df.iloc[0].to_numpy()/100
+        return data
 
-    def ytm_curve(self, as_numpy=False):
+    def ytm(self):
         """Computes the yield-to-maturity curve.
 
-        Args:
-            as_numpy (bool): If False, returns a Pandas Series. If True, returns two numpy arrays.
-
         Returns:
-            A Pandas Series or a tuple of two numpy arrays, the first one containing the maturities
-            and the second one containing the yield-to-maturity rates.
+            An array of the same shape as `self.maturities` with yield-to-maturity for each
+            available maturity.
         """
-        pass
+        ytm = np.empty_like(self.par_yield)
+
+        # For 1, 3, 6 months we can ignore the coupons
+        ytm[0] = 12*math.log(1+self.par_yield[0]/12)   # 1 month
+        ytm[1] = 4*math.log(1+self.par_yield[1]/4)     # 3 months
+        ytm[2] = 2*math.log(1+self.par_yield[2]/2)     # 6 months
+
+        # Bootstrap the rest
+        for i in range(3, len(self.maturities)):
+            t = self.maturities[i]
+            tprev = self.maturities[i-1]
+            coupon = self.par_yield[i]/2
+            # The next formula is due to the replication argument.
+            # By definition of par yield, the price of a bond with par yield `r` and face value 1
+            # is 1. 
+            # Then we try to replicate the bond maturiting at `t` with the bond maturing at `tprev`
+            # (they pay the same coupons until `tprev`) minus the discounted face value of the 
+            # latter bond, and discounted coupons paid between `tprev` and `t`.
+            price = lambda r: (
+                1/self.par_yield[i-1]*2*coupon*(1 - math.exp(-ytm[i-1]*tprev)) 
+                + math.exp(-r*t) 
+                + coupon*sum(math.exp(-r*s) for s in np.arange(tprev+0.5, t+0.1, 0.5)) 
+                - 1)
+            res = root_scalar(f=price, method='Newton', x0=ytm[i-1])
+            if res.converged:
+                ytm[i] = res.root
+            else:
+                ytm[i] = math.nan
+
+        return ytm
     
