@@ -167,11 +167,10 @@ class YFinanceData:
         """Computes forward prices and implied volatilities.
 
         Args:
-            discount_rates (float | list): Risk-free rates to use for discounting. If a float,
-                then a constant risk-free rate is assumed for all option maturities. If a list of
-                tuples (t,r), then the first element of a tuple must be the time to maturity in
-                years and the second element must be the corresponding risk-free rate. The risk-free
-                rate is linearly interpolated between the points in the list and extrapolated flat.
+            discount_rates (float | callable): Risk-free rates to use for discounting. If a float,
+                then a constant risk-free rate is assumed for all option maturities. If a callable,
+                it must accept a single argument (time to maturity in years) and return the
+                discount (risk-free) rate.
             otm_vol_only (bool): If True, then implied volatilities are computed only for
                 out-of-the-money and at-the-money options and set to NaN for in-the-money options.
                 If False, then implied volatilities are computed for all options. Note: computation
@@ -197,16 +196,8 @@ class YFinanceData:
             def discount(t):
                 return math.exp(-t*discount_rate)
         else:
-            discount_rate_interp = interpolate.interp1d(*zip(*discount_rate))
-
             def discount(t):
-                if t <= discount_rate[0][0]:
-                    r = discount_rate[0][1]
-                elif t >= discount_rate[-1][0]:
-                    r = discount_rate[-1][1]
-                else:
-                    r = discount_rate_interp(t)
-                return math.exp(-r*t)
+                return math.exp(-t*discount_rate(t))
 
         # Fill in the discountRate column of forward_prices
         self.forward_prices['discountFactor'] = self.forward_prices.timeToMaturity.apply(discount)
@@ -561,7 +552,7 @@ class CMTData:
                     '20 Yr', '30 Yr'])
         cmt.index.rename('Date', inplace=True)
 
-        with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        with pd.ExcelWriter(filename, engine='openpyxl', mode='a') as writer:
             cmt.to_excel(writer, sheet_name='CMT', header=True, index=True)
 
         # Nice formatting
