@@ -3,11 +3,13 @@ from .black import Black
 from .heston import Heston
 from .svi import SVI, ESSVI
 from .simulation import MCResult, monte_carlo
-from .yahoo import YFinanceData
+from .interest import NelsonSiegel
+from .data import YFinanceData, CMTData
 
 __all__ = ["implied_vol",
            "Black",
            "Heston",
            "SVI", "ESSVI",
+           "NelsonSiegel",
            "MCResult", "monte_carlo",
-           "YFinanceData"]
+           "YFinanceData", "CMTData"]
