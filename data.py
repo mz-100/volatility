@@ -82,7 +82,10 @@ class YFinanceData:
         data.ticker = ticker
 
         yf_ticker = yf.Ticker(ticker)
-        data.underlying_price = (yf_ticker.info['bid'] + yf_ticker.info['ask']) / 2
+        try:
+            data.underlying_price = (yf_ticker.info['bid'] + yf_ticker.info['ask']) / 2
+        except KeyError:
+            data.underlying_price = math.nan
 
         # Set time at which the data is loaded.
         # The `.astimezone()` adds timezone information to the datetime object if it does not have
