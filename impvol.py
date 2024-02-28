@@ -1,84 +1,86 @@
 import math
 import numpy as np
-from scipy.stats import norm
-from scipy.optimize import newton
+import numba
+from numba import float64
+from numba_stats.norm import ppf as _normppf
 
 
-def implied_vol(forward_price, maturity, strike, option_price, call_or_put_flag=1, discount_factor=1.0, check_price_bounds=True):
+def implied_vol(forward_price, maturity, strike, option_price, call_or_put_flag=1, discount_factor=1.0, eps=1.48e-08):
     """Computes Black implied volatility of European call or put options by Newton's method.
 
-    This function works with a single maturity and a single strike or an array of strikes.
-
     Args:
-        forward_price (float): Current forward price.
-        maturity (float): Time to maturity of options.
-        strike (float | ndarray): A single strike or an array of strikes.
-        price (float | ndarray) : Option prices. Must be of the same shape as `K`.
-        discount_factor (float): Discount factor.
-        call_or_put_flag (float | ndarray): 1 for call options, -1 for put options. Must be scalar
-            or of the same shape as `K`.
-        check_price_bounds (bool): If `True`, checks that the price is within the bounds implied by
-            the Black formula; when not, NaN is returned. If `False`, no checks are done.
+        forward_price (float or array): Current forward price.
+        maturity (float or array): Time to maturity.
+        strike (float or array): Strike.
+        price (float or array) : Option price.
+        discount_factor (float or array): Discount factor.
+        call_or_put_flag (float or array): 1 for a call option, -1 for a put option.
+        eps (float): Absolute error of the root finding method.
 
     Returns:
-        float | ndarray: A single implied volatility or an array of implied volatilities. If the
-            method fails to converge, `NaN` is returned for the corresponding options.
+        Implied volatility. If the method fails to converge, `NaN` is returned.
     """
-    theta = call_or_put_flag        # for brevity
+    # The actual computation is done by a Numba function. We have to use this wrapper as Numba's
+    # vectorization does not allow default values.
+    return _implied_vol(forward_price, maturity, strike, option_price, call_or_put_flag, discount_factor, eps)
 
-    # Normalization of parameters. See Jäckel (2006).
+
+@numba.njit(float64(float64))
+def normpdf(x):
+    """Standard normal density function."""
+    return 1/math.sqrt(2*math.pi)*math.exp(-0.5*x*x)
+
+
+@numba.njit(float64(float64))
+def normcdf(x):
+    """Standard normal cumulative distribution function."""
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+
+@numba.njit(float64(float64))
+def normppf(x):
+    """Inverse standard normal cumulative distribution function."""
+    # The following is needed because norm.ppf of numba_stats accepts
+    # only arrays
+    x_ = np.array([x])
+    return _normppf(x_, 0.0, 1.0)[0]
+
+
+# The function which performs the actual computation
+# We use Newton's method with selection of the initial guess by Jäckel (2006)
+@numba.vectorize([float64(float64, float64, float64, float64, float64, float64, float64)])
+def _implied_vol(forward_price, maturity, strike, option_price, call_or_put_flag, discount_factor, eps):
+    # Normalization of parameters
     # With the new variables, we are looking for sigma = implied_vol*sqrt(T)
-    x = np.log(forward_price/strike)
-    p = option_price/(discount_factor*np.sqrt(forward_price*strike))
+    x = math.log(forward_price/strike)
+    p = option_price/(discount_factor*math.sqrt(forward_price*strike))
 
-    # Check that the price is within the bounds implied by the Black formula
-    if check_price_bounds:
-        if np.isscalar(strike):
-            lower_bound = np.heaviside(theta*x, 0.5) * theta * (math.exp(x/2) - math.exp(-x/2))
-            upper_bound = math.exp(theta*x/2)
-            if p <= lower_bound or p >= upper_bound:
-                return np.NaN
-        else:
-            # For vector-valued arguments, we filter out invalid prices and call `implied_vol`
-            # for valid prices only. This is much faster than calling `implied_vol` for each
-            # option separately.
-            lower_bound = np.heaviside(theta*x, 0.5) * theta * (np.exp(x/2) - np.exp(-x/2))
-            upper_bound = np.exp(theta*x/2)
-            invalid = (p <= lower_bound) | (p >= upper_bound)
-            # If there are invalid prices, we call `implied_vol` for valid prices only
-            # If all prices are valid, we'll proceed to Newton's method
-            if np.any(invalid):
-                sigma = np.empty_like(strike)
-                sigma[~invalid] = implied_vol(
-                    forward_price=forward_price,
-                    maturity=maturity,
-                    strike=strike[~invalid],
-                    option_price=np.broadcast_to(option_price, strike.shape)[~invalid],
-                    call_or_put_flag=np.broadcast_to(call_or_put_flag, strike.shape)[~invalid],
-                    discount_factor=discount_factor,
-                    check_price_bounds=False)
-                sigma[invalid] = np.NaN
-                return sigma
+    # Explicit solution for ATM options
+    if np.isclose(x, 0):
+        return -2*normppf((1-p)/2)
 
-    # Initial guess for sigma. For ATM options, we use the explicit solution. For other options,
-    # we use the infliction point of the Black function. See Jäckel (2006).
-    sigma0 = np.where(np.isclose(x, 0), -2*norm.ppf((1-p)/2), np.sqrt(2*np.abs(x)))
+    # Check price bounds
+    theta = call_or_put_flag        # for brevity
+    lower_bound = theta * (math.exp(x/2) - math.exp(-x/2)) if theta*x > 0 else 0.0
+    upper_bound = math.exp(theta*x/2)
+    if p <= lower_bound or p >= upper_bound:
+        return math.nan
 
-    # Objective function: (normalized market price) - (normalized Black price)
-    def f(sigma):
-        return theta*(np.exp(x/2)*norm.cdf(theta*(x/sigma+sigma/2)) -
-                      np.exp(-x/2)*norm.cdf(theta*(x/sigma-sigma/2))) - p
+    # Initial guess for sigma - the infliction point of the Black function. See Jäckel (2006).
+    sigma = math.sqrt(2*abs(x))
 
-    # Objective function derivative (normalized vega)
-    def fprime(sigma):
-        return np.exp(x/2)*norm.pdf(x/sigma+sigma/2)
-
-    res = newton(func=f, x0=sigma0, fprime=None, full_output=True, disp=False)
-
-    if np.isscalar(strike):
-        return res[0]/math.sqrt(maturity) if res[1].converged else np.NaN
+    for n in range(0, 100):  # Maximum 100 iterations in Newton's method
+        f = theta*(math.exp(x/2)*normcdf(theta*(x/sigma+sigma/2)) -
+                   math.exp(-x/2)*normcdf(theta*(x/sigma-sigma/2))) - p
+        if abs(f) < eps:
+            break
+        fprime =  math.exp(x/2)*normpdf(x/sigma+sigma/2) 
+        sigma = sigma - f/fprime
+    
+    if n < 100:
+        return sigma/math.sqrt(maturity)
     else:
-        return np.where(res.converged, res.root/math.sqrt(maturity), np.NaN)
+        return math.nan
 
 
 """
