@@ -1,18 +1,13 @@
-from typing import Union
-from numpy import float_
-from numpy.typing import NDArray
-from numba.types import CPointer, float64, intc  # type: ignore
+from numba.types import CPointer, float64, intc
 from dataclasses import dataclass
 import math
 import cmath
 import numpy as np
-import numba                     # type: ignore
-import scipy.optimize as opt     # type: ignore
-import scipy.integrate as intg   # type: ignore
+import numba
+import scipy.optimize as opt
+import scipy.integrate as intg
 from scipy import LowLevelCallable
 from . import implied_vol
-from scipy.special import lambertw
-from scipy.misc import derivative
 
 
 # The following function computes the characteristic function of the log-price change `ln(F_t/F_0)`
