@@ -111,37 +111,44 @@ class Heston:
         """Computes call option prices.
 
         Args:
-            forward_price (float): Current forward price.
-            maturity (float): Time to maturity.
-            strike (float or array): A single strike or an array of strikes.
-            discount_factor: Discount factor.
+            forward_price (float or array): Current forward price.
+            maturity (float or array): Time to maturity.
+            strike (float or array): Strike.
+            discount_factor (float or array): Discount factor.
             epsabs (float): Absolute error tolerance passed to SciPy's integration routine.
             epsrel (float): Relative error tolerance passed to SciPy's integration routine.
 
         Returns:
-            A single option price or an array of prices of the same length as the array of strikes.
+            Call option price(s).
+
+        Notes:
+            If arrays are passed, they are broadcasted in the order [discount_factor, forward_price,
+            maturity, strike].
         """
-        if np.isscalar(strike):
+        if np.isscalar(forward_price) and np.isscalar(maturity) and np.isscalar(strike) and np.isscalar(discount_factor):
             return discount_factor*self._undiscounted_call_price(forward_price, maturity, strike, epsabs, epsrel)
         else:
-            return np.array([discount_factor*self._undiscounted_call_price(forward_price, maturity, k, epsabs, epsrel) for k in strike])
+            b = np.broadcast(discount_factor, forward_price, maturity, strike)
+            return np.array([d*self._undiscounted_call_price(f, t, k, epsabs, epsrel) for d, f, t, k in b]).reshape(b.shape)
 
     def put_price(self, forward_price, maturity, strike, discount_factor=1.0,
                    epsabs=1.49e-08, epsrel=1.49e-08):
         """Computes put option prices.
 
-        The computation is reduced to call options by the call-put parity.
-
         Args:
-            forward_price (float): Current forward price.
-            maturity (float): Time to maturity.
-            strike (float or array): A single strike or an array of strikes.
-            discount_factor: Discount factor.
+            forward_price (float or array): Current forward price.
+            maturity (float or array): Time to maturity.
+            strike (float or array): Strike.
+            discount_factor (float or array): Discount factor.
             epsabs (float): Absolute error tolerance passed to SciPy's integration routine.
             epsrel (float): Relative error tolerance passed to SciPy's integration routine.
 
         Returns:
-            A single option price or an array of prices of the same length as the array of strikes.
+            Call option price(s).
+
+        Notes:
+            The computation is reduced to call options by the call-put parity. If arrays are passed,
+            they are broadcasted in the order (discount_factor, forward_price, maturity, strike).
         """
         return self.call_price(forward_price, maturity, strike, discount_factor, epsabs, epsrel) - discount_factor*(forward_price - strike)
 
@@ -187,17 +194,23 @@ class Heston:
                            call_or_put_flag=1)
     
     @classmethod
-    def calibrate(cls, forward_price, maturity, strikes, implied_vol, initial_guess=None,
-                  min_method="SLSQP", return_minimize_result=False):
+    def calibrate(cls, forward_price, maturity, strike, implied_vol, initial_guess=None,
+                  bounds=None, min_method="SLSQP", return_minimize_result=False):
         """Calibrates the parameters of the Heston model.
 
         Args:
             forward_price (float): Initial forward price.
-            maturity (float): Maturity of options. Only fixed maturity is supported.
-            strikes (array): Array of strikes.
-            implied_vol (array): Array of market implied volatilities.
+            maturity (float): Time to maturity.
+            strike (array): Strike price.
+            implied_vol (array): Market implied volatilities.
             initial_guess: Initial guess for the parameters. Must be an instance of `Heston` class.
-                If `None`, the default guess is used.
+                If `None`, a default guess is used.
+            bounds (dict): Bounds for the parameters of the model. Must be a dict containing all
+                or some of the keys 'v0', 'kappa', 'theta', 'sigma', 'rho'. The value associated
+                with each key is a tuple `(lower, upper)` of lower and upper bounds for the
+                corresponding parameter. If a parameter is not included in the dict (or `bounds` is
+                `None`), the default bounds are used, which are as follows: `v0`: (0.001, 10),
+                `kappa`: (0.01, 5), `theta`: (0.001, 10), `sigma`: (0.001, 10), `rho`: (-0.9, 0.9).
             min_method: Minimization method to be passed to `scipy.optimize.minimize`. The method
                 must support bounds.
             return_minimize_result: If True, return also the minimization result of
@@ -206,8 +219,7 @@ class Heston:
         Returns:
             If `return_minimize_result` is True, returns a tuple `(cls, res)`, where `cls` is an
             instance of the class with the calibrated parameters and `res` in the optimization
-            result returned by `scipy.optimize.minimize` (useful for debugging). Otherwise returns
-            only `cls`.
+            result returned by `scipy.optimize.minimize`. Otherwise returns only `cls`.
 
         Notes:
             If `initial_guess` is not provided, the default guess is computed as follows:
@@ -216,17 +228,21 @@ class Heston:
                 - `rho` is -0.5.
         """
         if initial_guess is None:
-            v0 = implied_vol[np.abs(strikes-forward_price).argmin()]**2  # ATM variance
+            v0 = implied_vol.flat[np.abs(strike-forward_price).argmin()]**2  # ATM variance
             x0 = (v0, 1.0, v0, 1.0, -0.5)  # (V0, kappa, theta, sigma, rho)
         else:
             x0 = (initial_guess.v0, initial_guess.kappa, initial_guess.theta, initial_guess.sigma,
                   initial_guess.rho)
+        bounds_ = [(0.001, 10), (0.01, 5), (0.001, 10), (0.001, 10), (-0.9, 0.9)]
+        if bounds is not None:
+            for i, k in enumerate(['v0', 'kappa', 'theta', 'sigma', 'rho']):
+                if k in bounds:
+                    bounds_[i] = bounds[k]
         res = opt.minimize(
-            fun=lambda p: np.linalg.norm(Heston(*p).implied_vol(forward_price, maturity, strikes) - implied_vol),
+            fun=lambda p: np.linalg.norm(Heston(*p).implied_vol(forward_price, maturity, strike) - implied_vol),
             x0=x0,
             method=min_method,
-            bounds=[(0, math.inf), (0, math.inf), (0, math.inf), (0, math.inf),
-                    (-1, 1)])
+            bounds=bounds_)
         model = cls(v0=res.x[0], kappa=res.x[1], theta=res.x[2], sigma=res.x[3], rho=res.x[4])
         if return_minimize_result:
             return model, res
