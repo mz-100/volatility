@@ -4,7 +4,7 @@ from .heston import Heston
 from .svi import SVI, ESSVI
 from .simulation import MCResult, monte_carlo
 from .interest import NelsonSiegel
-from .data import YFinanceData, CMTData
+from .data import OptionData, CMTData
 
 __all__ = ["implied_vol",
            "Black",
@@ -12,4 +12,4 @@ __all__ = ["implied_vol",
            "SVI", "ESSVI",
            "NelsonSiegel",
            "MCResult", "monte_carlo",
-           "YFinanceData", "CMTData"]
+           "OptionData", "CMTData"]

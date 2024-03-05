@@ -2,7 +2,7 @@ import math
 import numpy as np
 import yfinance as yf
 import pandas as pd
-import pytz
+from zoneinfo import ZoneInfo
 import pickle
 from scipy.stats import norm
 import datetime
@@ -10,9 +10,10 @@ from scipy import interpolate
 from scipy.optimize import root_scalar
 from openpyxl import load_workbook
 from .impvol import implied_vol
+from .interest import NelsonSiegel
 
 
-class YFinanceData:
+class OptionData:
     """Class for loading options data from Yahoo Finance.
 
     Attributes:
@@ -40,7 +41,7 @@ class YFinanceData:
             after calling `process_data`).
 
     Methods:
-        load_from_web: Loads options data from Yahoo Finance.
+        load_from_yahoo: Loads options data from Yahoo Finance.
         process_data: Computes forward prices and implied volatilities.
         save_to_disk: Saves the object to disk in pickle or Excel format.
         load_from_disk: Loads the object from disk.
@@ -56,10 +57,12 @@ class YFinanceData:
     forward_prices: pd.DataFrame
     options: pd.DataFrame
 
-    @staticmethod
-    def load_from_web(ticker, min_maturity=None, max_maturity=None, expiration_time='16:00',
-                      expiration_timezone='America/New_York', access_time=None):
+    @classmethod
+    def load_from_yahoo(cls, ticker, min_maturity=None, max_maturity=None, access_time=None):
         """Loads options data from Yahoo Finance.
+
+        This method populates the object with the options data from Yahoo Finance. Implied 
+        volatilities and forward prices are not computed at this stage.
 
         Args:
             ticker (str): Ticker symbol.
@@ -78,7 +81,7 @@ class YFinanceData:
             YFinanceData object
         """
         # Empty object which we are going to fill with data
-        data = YFinanceData()
+        data = cls()
         data.ticker = ticker
 
         yf_ticker = yf.Ticker(ticker)
@@ -94,12 +97,11 @@ class YFinanceData:
         # We need to be careful with timezone information when subtracting dates and times
         # (e.g. for computing time to maturity) for short options. In principle, for options with
         # not so short maturities this could be ignored.
+        timezone = yf_ticker.info['timeZoneFullName'] 
         if access_time is None:
-            data.access_time = pd.Timestamp(datetime.datetime.now().astimezone())
+            data.access_time = datetime.datetime.now(tz=ZoneInfo(timezone))
         else:
-            data.access_time = pd.Timestamp(access_time.astimezone())
-
-        expiration_tz = pytz.timezone(expiration_timezone)
+            data.access_time = access_time.astimezone(ZoneInfo(timezone))
 
         # Loading option data from Yahoo 
         # First we load each maturity to a separate DataFrame as returned by yfinance, then join
@@ -109,27 +111,23 @@ class YFinanceData:
         # maturities in years
         time_to_maturities = {}
         for maturity_str in yf_ticker.options:      # yfinance stores maturities as strings
-            maturity = expiration_tz.localize(
-                datetime.datetime.strptime(maturity_str + " " + expiration_time, "%Y-%m-%d %H:%M"))
+            maturity = datetime.datetime.strptime(maturity_str, "%Y-%m-%d").date()
 
             # Skip options with maturities out of the range specified by the user (if any)
-            T = (maturity - data.access_time).total_seconds() / (365*24*60*60)
             if min_maturity is not None:
                 if isinstance(min_maturity, str):
-                    if datetime.datetime.strptime(min_maturity, "%Y-%m-%d") < maturity.date():
+                    if datetime.datetime.strptime(min_maturity, "%Y-%m-%d").date() > maturity:
                         continue
                 else:
-                    if T < min_maturity:
+                    if min_maturity > (maturity - data.access_time.date()).days / 365:
                         continue
             if max_maturity is not None:
                 if isinstance(max_maturity, str):
-                    if datetime.datetime.strptime(max_maturity, "%Y-%m-%d") > maturity.date():
+                    if datetime.datetime.strptime(max_maturity, "%Y-%m-%d").date() < maturity:
                         continue
                 else:
-                    if T > max_maturity:
+                    if max_maturity < (maturity - data.access_time.date()).days / 365:
                         continue
-
-            time_to_maturities[pd.Timestamp(maturity.date())] = T
 
             # Get calls and puts tables for this maturity and join them
             calls = yf_ticker.option_chain(maturity_str).calls
@@ -137,10 +135,12 @@ class YFinanceData:
             puts = yf_ticker.option_chain(maturity_str).puts
             puts['type'] = 'P'
             calls_and_puts = pd.concat([calls, puts], ignore_index=True)
-            calls_and_puts['maturity'] = pd.Timestamp(maturity.date())
+            calls_and_puts['maturity'] = pd.Timestamp(maturity)
             calls_and_puts['price'] = (calls_and_puts['bid'] + calls_and_puts['ask']) / 2
             calls_and_puts['spread'] = calls_and_puts['ask'] - calls_and_puts['bid']
-            options_dataframes.append(calls_and_puts)
+            # Add options for this maturity to the list, keeping only those with non-zero spread
+            # (zero spread means no bid and ask prices)
+            options_dataframes.append(calls_and_puts[calls_and_puts['spread'] > 0])
 
         # No options were loaded
         if not options_dataframes:
@@ -158,41 +158,46 @@ class YFinanceData:
 
         # Make a DataFrame with forward prices, which will be filled later. Now it only contains
         # maturity and timeToMaturity columns
-        data.forward_prices = pd.DataFrame(
-            data=[(maturity, time_to_maturities[maturity])
-                  for maturity in sorted(time_to_maturities)],
-            columns=['maturity', 'timeToMaturity'])
-        data.forward_prices.set_index('maturity', inplace=True)
+        # data.forward_prices = pd.DataFrame(
+        #     data=[(maturity, time_to_maturities[maturity])
+        #           for maturity in sorted(time_to_maturities)],
+        #     columns=['maturity', 'timeToMaturity'])
+        # data.forward_prices.set_index('maturity', inplace=True)
 
         return data
-
-    def process_data(self, discount_rate=0.0, otm_vol_only=True):
-        """Computes forward prices and implied volatilities.
+    
+    def compute_forwards(self, discount_rate=0.0, monotone=False):
+        """Computes forward prices from the options data.
 
         Args:
             discount_rates (float | callable): Risk-free rates to use for discounting. If a float,
                 then a constant risk-free rate is assumed for all option maturities. If a callable,
                 it must accept a single argument (time to maturity in years) and return the
-                discount (risk-free) rate.
-            otm_vol_only (bool): If True, then implied volatilities are computed only for
-                out-of-the-money and at-the-money options and set to NaN for in-the-money options.
-                If False, then implied volatilities are computed for all options. Note: computation
-                of implied volatility may fail for deep in-the-money options.
+                discount rate.
+            monotone (bool): Ensure that the forward prices are non-decreasing with maturity by
+                setting each price not smaller than the price for the previous maturity. This may
+                break the call-put parity.
 
         Returns:
-            The object itself with added forward prices and implied volatilities.
-
-        Notes:
-            The computation of forward prices is based on the call-put parity applied to the
-            available market option prices. For each maturity, we use the pair of a call and a put
-            with the same strike which have the smallest difference in price.
+            The object itself with added forward prices and added columns `logStrike` and `OTM` to
+            the options DataFrame.
         """
         if not hasattr(self, 'options'):
             raise RuntimeError('You need to load options data first')
-        
-        #################################
-        # Computation of forward prices #
-        #################################
+
+        # Creating a dataframe and adding time to maturity (business and calendar)
+        maturities = self.options.index.unique('maturity')
+        self.forward_prices = pd.DataFrame(
+             data=[(maturity, 
+                    (maturity.date()-self.access_time.date()).days/365,
+                    np.busday_count(self.access_time.date(), maturity.date())/250)
+                   for maturity in maturities],
+             columns=['maturity', 'calTimeToMaturity', 'busTimeToMaturity'])
+        self.forward_prices.set_index('maturity', inplace=True)
+
+        # Correct negative maturities (for options expiring on the same day as access_time)
+        self.forward_prices.calTimeToMaturity[self.forward_prices.calTimeToMaturity<0] = 0
+        self.forward_prices.busTimeToMaturity[self.forward_prices.busTimeToMaturity<0] = 0
 
         # Make a function for computing the appropriate discount factors
         if np.isscalar(discount_rate):
@@ -203,7 +208,7 @@ class YFinanceData:
                 return math.exp(-t*discount_rate(t))
 
         # Fill in the discountRate column of forward_prices
-        self.forward_prices['discountFactor'] = self.forward_prices.timeToMaturity.apply(discount)
+        self.forward_prices['discountFactor'] = self.forward_prices.calTimeToMaturity.apply(discount)
 
         # A function for computing forward prices for each maturity, which will be called for each
         # row of the forward_prices DataFrame
@@ -227,7 +232,7 @@ class YFinanceData:
                 K = price_diff.idxmin()
                 P = puts.loc[K].price
                 C = calls.loc[K].price
-                T = forward.timeToMaturity
+                T = forward.calTimeToMaturity
                 d = discount(T)
                 return K + d*(C-P)
             else:
@@ -236,10 +241,13 @@ class YFinanceData:
         # Fill in the forwardPrice column of forward_prices
         self.forward_prices['forwardPrice'] = self.forward_prices.apply(compute_forward_price, axis=1)
 
-        #######################################
-        # Computation of implied volatilities #
-        #######################################
-
+        # Apply monotonicity correction
+        if monotone:
+            for i in range(1, len(self.forward_prices)):
+                self.forward_prices.forwardPrice.iloc[i] = max(
+                    self.forward_prices.forwardPrice.iloc[i], self.forward_prices.forwardPrice.iloc[i-1])
+                           
+        # Add logStrike and OTM columns to the options DataFrame
         self.options['logStrike'] = self.options.apply(
             # index: x.name = (maturity, type, strike)
             lambda x: math.log(x.name[2] / self.forward_prices.loc[x.name[0]].forwardPrice),
@@ -248,14 +256,32 @@ class YFinanceData:
             lambda x: x.logStrike >= 0 if x.name[1] == 'C' else x.logStrike <= 0,
             axis=1)
 
+        return self
+    
+    def compute_volatility(self, otm_vol_only=True):
+        """Computes implied volatilities.
+
+        Args:
+            vol_type (str or list of str): Type of implied volatility to compute. Can be 'mid' for
+                mid implied volatility, 'bid' for bid implied volatility, 'ask' for ask implied
+                volatility, or a list of these.
+            otm_vol_only (bool): If True, then implied volatilities are computed only for
+                out-of-the-money and at-the-money options and set to NaN for in-the-money options.
+
+        Returns:
+            The object itself with added forward prices and implied volatilities.
+        """
         # Define three functions for computing implied volatility, delta and total variance
         # which will be called for each row of the options DataFrame
         def compute_iv(option):     # option is a row of the options DataFrame
             if otm_vol_only and not option.OTM:
                 return math.nan
+            t = self.forward_prices.loc[option.name[0]].busTimeToMaturity
+            if t == 0:
+                return math.nan
             return implied_vol(
                 forward_price=self.forward_prices.loc[option.name[0]].forwardPrice,
-                maturity=self.forward_prices.loc[option.name[0]].timeToMaturity,
+                maturity=t,
                 strike=option.name[2],
                 option_price=option.price,
                 call_or_put_flag=(1 if option.name[1] == 'C' else -1),
@@ -264,14 +290,14 @@ class YFinanceData:
         def compute_totalvar(option):
             if option.impliedVol is math.nan:
                 return math.nan
-            return option.impliedVol**2 * self.forward_prices.loc[option.name[0]].timeToMaturity
+            return option.impliedVol**2 * self.forward_prices.loc[option.name[0]].busTimeToMaturity
         
         def compute_delta(option):
             if option.impliedVol is math.nan:
                 return math.nan
             d1 = 0.5*math.sqrt(option.totalVar) - option.logStrike / math.sqrt(option.totalVar)
             d = self.forward_prices.loc[option.name[0]].discountFactor
-            T = self.forward_prices.loc[option.name[0]].timeToMaturity
+            T = self.forward_prices.loc[option.name[0]].busTimeToMaturity
             if option.name[1] == 'C':
                 return d * norm.cdf(d1)
             else:
@@ -370,8 +396,8 @@ class YFinanceData:
         else:
             raise ValueError(f'Unknown backend: {backend}')
 
-    @staticmethod
-    def load_from_disk(filename, backend=None):
+    @classmethod
+    def load_from_disk(cls, filename, backend=None):
         """Loads data from disk.
 
         Supports pickle and Excel backends. See `save_to_disk` for details on the format of the
@@ -402,7 +428,7 @@ class YFinanceData:
             with open(filename, 'rb') as f:
                 return pickle.load(f)
         elif backend == 'excel':
-            data = YFinanceData()
+            data = cls()
             info = pd.read_excel(
                 filename, sheet_name='Info', header=0, index_col=False)
             data.ticker = info.ticker[0]
@@ -621,4 +647,7 @@ class CMTData:
                 ytm[i] = math.nan
 
         return ytm
+    
+    def nelson_siegel_curve(self):
+        return NelsonSiegel.calibrate(self.maturities, self.ytm())
     
