@@ -9,6 +9,7 @@ import datetime
 from scipy import interpolate
 from scipy.optimize import root_scalar
 from openpyxl import load_workbook
+import os
 from .impvol import implied_vol
 from .interest import NelsonSiegel
 
@@ -327,7 +328,7 @@ class OptionData:
         Returns:
             None
         """
-        if not (hasattr(self, 'forward_prices') and hasattr(self, 'options')):
+        if not hasattr(self, 'options'):
             raise RuntimeError('Looks like the data has not been loaded yet - aborting')
         if backend is None:
             # Determine backend from filename extension: pickle or excel
@@ -349,8 +350,9 @@ class OptionData:
                 columns=['ticker', 'accessTime', 'underlyingPrice'])
             with pd.ExcelWriter(filename, engine='openpyxl') as writer:
                 info.to_excel(writer, sheet_name='Info', header=True, index=False)
-                self.forward_prices.to_excel(writer, sheet_name='Forwards', header=True, index=True)
                 self.options.to_excel(writer, sheet_name='Options', header=True, index=True)
+                if hasattr(self, 'forward_prices'):
+                    self.forward_prices.to_excel(writer, sheet_name='Forwards', header=True, index=True)
 
             ##########################################
             # Nice visual formatiing of Excel sheets #
@@ -366,13 +368,15 @@ class OptionData:
 
             # Forwards sheet
             # Columns: A = maturity, B = timeToMaturity, C = discountRate, D = forwardPrice
-            W['Forwards'].column_dimensions['A'].width = len('YYYY-MM-DD') + 2
-            for cell in W['Forwards']['A']:
-                cell.number_format = 'YYYY-MM-DD'
-            for col in ['B', 'C', 'D']:
-                W['Forwards'].column_dimensions[col].width = 16
-                for cell in W['Forwards'][col]:
-                    cell.number_format = '0.0000'
+            if hasattr(self, 'forward_prices'):
+                W['Forwards'].column_dimensions['A'].width = len('YYYY-MM-DD') + 2
+                for cell in W['Forwards']['A']:
+                    cell.number_format = 'YYYY-MM-DD'
+                for col in ['B', 'C', 'D']:
+                    W['Forwards'].column_dimensions[col].width = 16
+                    for cell in W['Forwards'][col]:
+                        cell.number_format = '0.0000'
+                W["Forwards"].freeze_panes = "A2"
 
             # Options sheet
             # Columns: A = maturity, B = type, C = strike, D = price, E = spread,
@@ -387,9 +391,6 @@ class OptionData:
             for col in ['D', 'E', 'F', 'G', 'I', 'J', 'K']:
                 for cell in W['Options'][col]:
                     cell.number_format = '0.0000'
-
-            # Finally freeze panes
-            W["Forwards"].freeze_panes = "A2"
             W["Options"].freeze_panes = "D2"
 
             W.save(filename)
@@ -435,10 +436,14 @@ class OptionData:
             data.access_time = pd.Timestamp(
                 datetime.datetime.strptime(info.accessTime[0], '%Y-%m-%d %H:%M:%S %z'))
             data.underlying_price = info.underlyingPrice[0]
-            data.forward_prices = pd.read_excel(
-                filename, sheet_name='Forwards', header=0, index_col=0)
             data.options = pd.read_excel(
                 filename, sheet_name='Options', header=0, index_col=[0, 1, 2])
+            # Try to load the Forwards sheet if it exists
+            try:
+                data.forward_prices = pd.read_excel(
+                    filename, sheet_name='Forwards', header=0, index_col=0)
+            except:
+                pass
             return data
         else:
             raise ValueError(f'Unknown backend: {backend}')
@@ -451,60 +456,96 @@ class OptionData:
             max_maturity (str | Timestamp): Return maturities not greater than this value.
 
         Returns:
-            A list of Timestamps representing the available maturities.
+            A dictionary with available maturities as keys in the string format "YYY-MM-DD" and
+            business time to maturity as values.
         """
-        return self.forward_prices[min_maturity:max_maturity].index.to_list()
+        return {m.strftime("%Y-%m-%d") : self.forward_prices.loc[m].busTimeToMaturity
+                for m in self.forward_prices[min_maturity:max_maturity].index}
     
-    def get_implied_vol(self, maturity, moneyness_bounds=None, min_abs_delta=None,
-                        return_total_var=False, as_numpy=False):
-        """The implied volatility or total variance curve of OTM options at a given maturity.
+    def get_time_to_maturity(self, maturity):
+        """Returns the business time to maturity for a given maturity.
 
         Args:
-            maturity (str | datetime | Timestamp): Maturity of the options. If a string, the
-                format must be accepted by Pandas.
-            moneyness_bounds ((float, float)): Tuple of two floats representing the lower and upper
-                bounds for the moneyness of the options to include in the curve. The moneyness is
-                defined as forward/strike for calls and strike/forward for puts. Thus, OTM options
-                have moneyness < 1, and ITM options have moneyness > 1. If moneyness_bounds is None,
-                all options are included. To omit one of the bounds, set it to 0 or inf.
+            maturity (str | Timestamp): Maturity of the options.
+
+        Returns:
+            float: Business time to maturity in years.
+        """
+        return self.forward_prices.loc[maturity].busTimeToMaturity
+    
+    def get_smile(self, maturity, min_abs_delta=None, return_total_var=False, flatten=False,
+                  unpack=False, max_points=None):
+        """The implied volatility or total variance smile of OTM options for a given maturity.
+
+        Args:
+            maturity (str | datetime | Timestamp | list): Maturity of the options. If a string, the
+                format must be accepted by Pandas. Several maturities can be provided as a list.
             min_abs_delta (float): Only options with the absolute value of delta not smaller than
                 this number will be included in the curve. If None, all options are included.
             return_total_var (bool): If False, return the implied volatility curve in the
                 coordinates (strike, implied_vol). If True, return the total variance curve in the
                 coordinates (log_strike, total_var), where `log_strike = log(strike/forward)`.
-            as_numpy (bool): If True, then return the of two numpy arrays: (strikes, implied_vol) or
-                (log_strike, total_var). If False, then return a Pandas Series with strikes or
-                log-moneyness as the index and implied volatilities or total variances as values.
+            flatten (bool): If True, the result is returned as a tuple of four numpy arrays. If
+                False, the result is returned as a list of tuples. See the Returns section for
+                details.
+            unpack (bool): Unpacks the result if `flatten` is False.
+            max_points (int): Maximum number of strikes to include in the smile. Strikes are taken
+                at regular intervals from the whole range of strikes. If None, all strikes are
+                included. 
 
         Returns:
-            A Pandas Series with strike as index and implied volatility as values (or log-moneyness
-            and total variance) or a tuple of two numpy arrays, the first being the array of strikes
-            and the second being the array of implied volatilities (or, again, log-moneyness and
-            total variance).
+            If `flatten` is False and 'unpack` is False, a list of tuples, each containing two
+                floats (forward price and time to maturity) and two numpy arrays (strikes and
+                implied volatilities, or log-strikes and total variances).
+            If `flatten` is False and 'unpack` is True, the result is unpacked as a tuple of four
+                lists.
+            If `flatten` is True, a tuple of four numpy arrays of the same length: forward prices,
+                times to maturity, strikes or log-strikes, and implied volatilities or total
+                variances. In this case `unpack` is ignored.
         """
-        if moneyness_bounds is None:
-            moneyness_bounds = (-np.inf, np.inf)
         if min_abs_delta is None:
             min_abs_delta = 0
 
-        # options with the given maturity and filtered for moneyness and delta
-        options = self.options.loc[maturity].copy().reset_index()
-        options['moneyness'] = options.apply(
-            lambda option: math.exp(option.logStrike * (-1 if option.type == 'C' else 1)),
-            axis=1)
-        filtered_options = options[options.OTM &
-                                   options.moneyness.between(*moneyness_bounds) &
-                                   (options.delta.abs() >= min_abs_delta)]
-
-        if return_total_var:
-            returned_data = filtered_options.set_index('logStrike').sort_index().totalVar
+        if isinstance(maturity, list):
+            maturities_list = maturity
         else:
-            returned_data = filtered_options.set_index('strike').sort_index().impliedVol
+            maturities_list = [maturity]
 
-        if as_numpy:
-            return returned_data.index.to_numpy(), returned_data.to_numpy()
+        # Collect the data for each maturity
+        ret = []
+        for m in maturities_list:
+            # Forward price and time to maturity
+            f = self.forward_prices.loc[m].forwardPrice
+            t = self.forward_prices.loc[m].busTimeToMaturity
+            # options with the given maturity and filtered for delta
+            options = self.options.loc[m].copy().reset_index()
+            filtered_options = options[options.OTM & (options.delta.abs() >= min_abs_delta)]
+            # Take only max_points strikes
+            if max_points is not None and len(filtered_options) > max_points:
+                step = len(filtered_options) // max_points
+                filtered_options = filtered_options.iloc[::step]
+
+            if return_total_var:
+                data = filtered_options.set_index('logStrike').sort_index().totalVar
+            else:
+                data = filtered_options.set_index('strike').sort_index().impliedVol
+            
+            ret.append((f, t, data.index.to_numpy(), data.to_numpy()))
+
+        if flatten:
+            f = np.concatenate([[f]*len(x) for f, _, x, _ in ret])
+            t = np.concatenate([[t]*len(x) for _, t, x, _ in ret])
+            x = np.concatenate([x for _, _, x, _ in ret])
+            y = np.concatenate([y for _, _, _, y in ret])
+            return f, t, x, y
         else:
-            return returned_data
+            if isinstance(maturity, list):
+                if unpack:
+                    return tuple(zip(*ret))
+                else:
+                    return ret
+            else:
+                return ret[0]
         
 
 class CMTData:
@@ -570,9 +611,6 @@ class CMTData:
 
         Returns:
             None
-
-        Notes:
-            If the file exists, a sheet called 'CMT' will be added to it.
         """
         cmt = pd.DataFrame(
             data=[self.par_yield*100],
@@ -581,7 +619,7 @@ class CMTData:
                     '20 Yr', '30 Yr'])
         cmt.index.rename('Date', inplace=True)
 
-        with pd.ExcelWriter(filename, engine='openpyxl', mode='a') as writer:
+        with pd.ExcelWriter(filename, engine='openpyxl', mode='w') as writer:
             cmt.to_excel(writer, sheet_name='CMT', header=True, index=True)
 
         # Nice formatting
