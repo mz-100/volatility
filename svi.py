@@ -199,8 +199,8 @@ class SVI:
             })
         return res.fun, res.x[0]
 
-    @classmethod
-    def _calibrate_adc(cls, x, w, m, sigma):
+    @staticmethod
+    def _calibrate_adc(x, w, m, sigma):
         """Calibrates the raw parameters `a, d, c` given `m, sigma`.
 
         This is an auxiliary function used in the two-step calibration procedure. It finds optimal
@@ -216,40 +216,77 @@ class SVI:
             Tuple `((a, d, c), f)` where `a, d, c` are the calibrated parameters and `f` is the
             minimum of the objective function.
         """
-        # The parameters (a, d, c) are found by the least squares method
-        X = np.stack([np.ones_like(x), (x-m)/sigma, np.sqrt(((x-m)/sigma)**2+1)], axis=1)
-        # p is the minimizer, s[0] is the sum of squared residuals
-        p, s = np.linalg.lstsq(X, w, rcond=None)[:2]
-        return p, s[0]   
+        # Objective function; p = (a, d, c)
+        def f(p):
+            return 0.5*np.linalg.norm(
+                p[0] + p[1]*(x-m)/sigma + p[2]*np.sqrt(((x-m)/sigma)**2+1) -
+                w)**2
+
+        # Gradient of the objective function
+        def fprime(p):
+            v1 = (x-m)/sigma
+            v2 = np.sqrt(((x-m)/sigma)**2+1)
+            v = p[0] + p[1]*v1 + p[2]*v2 - w
+            return (np.sum(v), np.dot(v1, v), np.dot(v2, v))
+
+        res = optimize.minimize(
+            f,
+            x0=(np.max(w)/2, 0, 2*sigma),
+            method="SLSQP",
+            jac=fprime,
+            bounds=[(None, np.max(w)), (None, None), (0, 4*sigma)],
+            constraints=[
+                {'type': 'ineq',
+                 'fun': lambda p: p[2]-p[1],
+                 'jac': lambda _: (0, -1, 1)},
+                {'type': 'ineq',
+                 'fun': lambda p: p[2]+p[1],
+                 'jac': lambda _: (0, 1, 1)},
+                {'type': 'ineq',
+                 'fun': lambda p: 4*sigma - p[2]-p[1],
+                 'jac': lambda _: (0, -1, -1)},
+                {'type': 'ineq',
+                 'fun': lambda p: p[1]+4*sigma-p[2],
+                 'jac': lambda _: (0, 1, -1)}])
+        return res.x, res.fun
 
     @classmethod
-    def calibrate(cls, x, w, min_sigma=1e-4, max_sigma=10, method="differential_evolution"):
+    def calibrate(cls, x, w, min_sigma=1e-4, max_sigma=10, return_minimize_result=False):
         """Calibrates the parameters of the model.
 
         This function finds the parameters which minimize the mean square error between the given
-        total implied variance curve and the one produced by the model. The calibration is performed
-        by the two-step minimization procedure by Zeliade systems.
+        total implied variance curve and the one produced by the model.
 
         Args:
             x (array): Array of log-moneynesses
             w (array): Array of total implied variances.
             min_sigma (float): Left bound for the value of `sigma`.
             max_sigma (float): Right bound for the value of `sigma`.
-            method (str): Method used for minimization. Must be a name of a global optimization 
-                method from `scipy.optimize` module.
+            return_minimize_result (bool): If True, returns also the minimization result of SciPy's
+                dual annealing algorithm.
 
         Returns:
-            An instance of the class with the calibrated parameters.
+            If `return_minimize_result` is True, returns a tuple `(cls, res)`, where `cls` is an
+            instance of the class and `res` in the optimization result returned by
+            `scipy.optimize.dual_annealing`. Otherwise returns only `cls`.
+
+        Notes:
+            The algorithm used is the two-step minimization procedure by Zeliade systems.
         """
         bounds = [(min(x), max(x)), (min_sigma, max_sigma)]
-        res = optimize.__dict__[method](
+        res = optimize.dual_annealing(
             lambda q: cls._calibrate_adc(x, w, q[0], q[1])[1],  # q=(m, sigma)
-            bounds=bounds)
+            bounds=bounds,
+            minimizer_kwargs={"method": "L-BFGS-B", "bounds" : bounds})
         m, sigma = res.x
         a, d, c = cls._calibrate_adc(x, w, m, sigma)[0]
         rho = d/c
         b = c/sigma
-        return cls(a, b, rho, m, sigma)
+        ret = cls(a, b, rho, m, sigma)
+        if return_minimize_result:
+            return ret, res
+        else:
+            return ret
 
 
 class ESSVI:
