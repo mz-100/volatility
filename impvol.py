@@ -57,7 +57,7 @@ def _implied_vol(forward_price, maturity, strike, option_price, call_or_put_flag
 
     # Explicit solution for ATM options
     if np.isclose(x, 0):
-        return -2*normppf((1-p)/2)
+        return -2*normppf((1-p)/2)/math.sqrt(maturity)
 
     # Check price bounds
     theta = call_or_put_flag        # for brevity
